@@ -1,58 +1,95 @@
 import json
 import requests
-import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
-# Агрегатор новостей/уведомлений, который отдает данные без блокировок
-DATA_URL = "https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fnews.rambler.ru%2Frss%2Fincidents%2F"
+# Два независимых RSS-источника для большей стабильности
+URLS = [
+    "https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fnews.rambler.ru%2Frss%2Fincidents%2F",
+    "https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fwww.vedomosti.ru%2Frss%2Fnews"
+]
 
-# Маппинг регионов на ISO-коды (для карты мира формат ISO обычно двухсимвольный или трехсимвольный)
-# В GeoJSON мира Россия обычно идет как целая страна (RU), либо разбита на регионы.
-# Если используем карту мира с разбивкой по странам, подсвечивать будем саму Россию (RU), либо конкретные ISO регионов.
+# Соответствие корней слов ISO-кодам регионов
 REGION_MAPPING = {
-    "курск": "RU-KUR", "орловск": "RU-ORL", "тверск": "RU-TVE",
-    "тульск": "RU-TUL", "калужск": "RU-KLU", "московск": "RU-MOS",
-    "белгород": "RU-BEL", "брянск": "RU-BRY", "воронеж": "RU-VOR"
+    "курск": "RU-KUR",
+    "орлов": "RU-ORL",
+    "твер": "RU-TVE",
+    "тульс": "RU-TUL",
+    "калуж": "RU-KLU",
+    "москов": "RU-MOS",
+    "подмосков": "RU-MOS",
+    "белг": "RU-BEL",
+    "брян": "RU-BRY",
+    "ворон": "RU-VOR",
+    "ростов": "RU-ROS",
+    "краснодар": "RU-KDA",
+    "крым": "RU-CR"
 }
 
 def main():
+    # 1. Загружаем текущую базу алертов или создаем пустую
     try:
         with open('alerts.json', 'r', encoding='utf-8') as f:
             alerts = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         alerts = {}
 
-    try:
-        response = requests.get(DATA_URL, timeout=10)
-        if response.status_code == 200:
-            items = response.json().get("items", [])
-            
-            for item in items:
-                title = item.get("title", "").lower()
-                description = item.get("description", "").lower()
-                full_text = title + " " + description
-                
-                # Ищем маркеры опасности
-                is_alert = "бпла" in full_text or "воздушная тревога" in full_text or "ракетная опасность" in full_text
-                is_clear = "отбой" in full_text
-                
-                if not is_alert and not is_clear:
-                    continue
-                
-                for key, iso in REGION_MAPPING.items():
-                    if key in full_text:
-                        if is_alert and not is_clear:
-                            alerts[iso] = {"alert": 1, "time": datetime.utcnow().isoformat()}
-                        elif is_clear:
-                            alerts[iso] = {"alert": 0, "time": datetime.utcnow().isoformat()}
-            
-            with open('alerts.json', 'w', encoding='utf-8') as f:
-                json.dump(alerts, f, ensure_ascii=False, indent=2)
-            print("Данные успешно обновлены.")
-        else:
-            print(f"Ошибка запроса: {response.status_code}")
-    except Exception as e:
-        print(f"Ошибка парсинга: {e}")
+    # 2. Собираем новости из источников
+    for url in URLS:
+        try:
+            response = requests.get(url, timeout=15)
+            if response.status_code == 200:
+                items = response.json().get("items", [])
+                for item in items:
+                    title = item.get("title", "").lower()
+                    description = item.get("description", "").lower()
+                    full_text = title + " " + description
+                    
+                    # Маркеры опасности и отбоя
+                    is_alert = any(w in full_text for w in ["бпла", "беспилотник", "воздушная тревога", "ракетная опасность", "атака бпла"])
+                    is_clear = any(w in full_text for w in ["отбой", "ликвидиров", "сбит", "подавлен"])
+                    
+                    if not is_alert and not is_clear:
+                        continue
+                        
+                    # Проверяем регионы
+                    for key, iso in REGION_MAPPING.items():
+                        if key in full_text:
+                            # Если это чистая атака/тревога без упоминания отбоя
+                            if is_alert and not is_clear:
+                                alerts[iso] = {
+                                    "alert": 1,
+                                    "time": datetime.utcnow().isoformat(),
+                                    "title": item.get("title", "")
+                                }
+                            # Если в тексте фигурирует отбой
+                            elif is_clear:
+                                alerts[iso] = {
+                                    "alert": 0,
+                                    "time": datetime.utcnow().isoformat(),
+                                    "title": item.get("title", "")
+                                }
+        except Exception as e:
+            print(f"Ошибка при запросе к {url}: {e}")
+
+    # 3. Авто-отбой: если тревога висит дольше 6 часов, снимаем её (на случай, если СМИ не дали новость об отбое)
+    now = datetime.utcnow()
+    for iso, info in list(alerts.items()):
+        if info.get("alert") == 1:
+            try:
+                alert_time = datetime.fromisoformat(info.get("time"))
+                if now - alert_time > timedelta(hours=6):
+                    alerts[iso] = {
+                        "alert": 0,
+                        "time": now.isoformat(),
+                        "title": "Автоматическое снятие по таймауту"
+                    }
+            except Exception:
+                pass
+
+    # 4. Сохраняем обновленный файл
+    with open('alerts.json', 'w', encoding='utf-8') as f:
+        json.dump(alerts, f, ensure_ascii=False, indent=2)
+    print("Файл alerts.json успешно обновлен.")
 
 if __name__ == "__main__":
     main()
