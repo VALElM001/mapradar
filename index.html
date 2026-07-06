@@ -3,13 +3,17 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Мировой Мониторинг Тревог</title>
+    <title>Мониторинг воздушных угроз и БПЛА</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <style>
-        body, html { margin: 0; padding: 0; height: 100%; background: #0f172a; font-family: sans-serif; }
+        body, html { margin: 0; padding: 0; height: 100%; background: #0b0f19; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #fff; }
         #map { height: 100vh; width: 100vw; }
-        .legend { background: rgba(15, 23, 42, 0.9); color: white; padding: 12px; border-radius: 8px; border: 1px solid #334155; }
-        .legend i { width: 16px; height: 16px; float: left; margin-right: 8px; border-radius: 4px; }
+        .legend { background: rgba(15, 23, 42, 0.95); color: #f8fafc; padding: 15px; border-radius: 10px; border: 1px solid #334155; line-height: 22px; font-size: 13px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.5); }
+        .legend i { width: 18px; height: 18px; float: left; margin-right: 10px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.2); }
+        .leaflet-popup-content-wrapper { background: #1e293b; color: #fff; border: 1px solid #475569; border-radius: 8px; }
+        .leaflet-popup-tip { background: #1e293b; }
+        .popup-title { font-weight: bold; border-bottom: 1px solid #475569; padding-bottom: 4px; margin-bottom: 6px; color: #f1f5f9; }
+        .popup-status { font-size: 12px; color: #94a3b8; }
     </style>
 </head>
 <body>
@@ -18,79 +22,96 @@
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-    // Центрируем карту мира
-    const map = L.map('map').setView([40.0, 20.0], 3);
+    // Конфигурируем карту с фокусом на европейскую часть
+    const map = L.map('map', {
+        worldCopyJump: true
+    }).setView([53.0, 37.0], 5);
 
-    // Слой подложки (темная тема)
+    // Стильная темная подложка карты (CartoDB DarkMatter)
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-        attribution: '&copy; OpenStreetMap &copy; CARTO'
+        attribution: '&copy; OpenStreetMap &copy; CARTO',
+        maxZoom: 10,
+        minZoom: 2
     }).addTo(map);
 
-    async function initMap() {
-        // Загружаем карту мира с детализацией регионов (включая субъекты РФ)
-        const geojsonRes = await fetch('https://raw.githubusercontent.com/codeforamerica/click_that_hood/master/public/data/russia.geojson');
-        const russiaData = await geojsonRes.json();
-        
-        // Загружаем общие границы стран мира для фона
-        const worldRes = await fetch('https://raw.githubusercontent.com/johan/world.geo.json/master/countries.geo.json');
-        const worldData = await worldRes.json();
+    // Маппинг для сопоставления имен из GeoJSON с нашими ISO кодами
+    const geoJsonMapping = {
+        "Курская обл.": "RU-KUR", "Орловская обл.": "RU-ORL", "Тверская обл.": "RU-TVE",
+        "Тульская обл.": "RU-TUL", "Калужская обл.": "RU-KLU", "Московская обл.": "RU-MOS",
+        "г. Москва": "RU-MOS", "Белгородская обл.": "RU-BEL", "Брянская обл.": "RU-BRY",
+        "Воронежская обл.": "RU-VOR", "Ростовская обл.": "RU-ROS", "Краснодарский край": "RU-KDA",
+        "Респ. Крым": "RU-CR", "г. Севастополь": "RU-CR"
+    };
 
-        const alertsRes = await fetch('alerts.json?t=' + Date.now());
-        const alertsData = await alertsRes.json();
+    async function loadAlertsMap() {
+        try {
+            // 1. Загружаем GeoJSON стран мира для красивого заднего фона
+            const worldRes = await fetch('https://raw.githubusercontent.com/johan/world.geo.json/master/countries.geo.json');
+            const worldData = await worldRes.json();
+            L.geoJson(worldData, {
+                style: { fillColor: '#111827', weight: 1, opacity: 0.3, color: '#374151', fillOpacity: 0.5 }
+            }).addTo(map);
 
-        // Отображаем сначала все страны мира серым цветом
-        L.geoJson(worldData, {
-            style: {
-                fillColor: '#1e293b',
-                weight: 1,
-                opacity: 0.4,
-                color: '#475569',
-                fillOpacity: 0.4
-            }
-        }).addTo(map);
+            // 2. Загружаем стандартизированные границы регионов РФ
+            const regionsRes = await fetch('https://raw.githubusercontent.com/w96k/ru-geojson/master/geojson/regions.geojson');
+            const regionsData = await regionsRes.json();
 
-        // Поверх накладываем сетку регионов с проверкой алертов
-        L.geoJson(russiaData, {
-            style: function(feature) {
-                const name = feature.properties.name ? feature.properties.name.toLowerCase() : "";
-                
-                let isoCode = null;
-                const mapping = {
-                    "курская область": "RU-KUR", "орловская область": "RU-ORL", "тверская область": "RU-TVE",
-                    "тульская область": "RU-TUL", "калужская область": "RU-KLU", "московская область": "RU-MOS",
-                    "белгородская область": "RU-BEL", "брянская область": "RU-BRY", "воронежская область": "RU-VOR"
-                };
-                
-                for (let key in mapping) {
-                    if (name.includes(key)) { isoCode = mapping[key]; break; }
+            // 3. Загружаем наши динамические данные о тревогах (с защитой от кэширования браузером)
+            const alertsRes = await fetch('alerts.json?nocache=' + Date.now());
+            const alertsData = await alertsRes.json();
+
+            // 4. Отрисовываем регионы поверх карты мира
+            L.geoJson(regionsData, {
+                style: function(feature) {
+                    const regionName = feature.properties.name;
+                    const isoCode = geoJsonMapping[regionName];
+                    
+                    // Проверяем статус алертов
+                    const isRed = isoCode && alertsData[isoCode] && alertsData[isoCode].alert === 1;
+
+                    return {
+                        fillColor: isRed ? '#ef4444' : '#10b981',
+                        weight: 1.5,
+                        opacity: 0.8,
+                        color: '#1e293b',
+                        fillOpacity: isRed ? 0.6 : 0.15
+                    };
+                },
+                onEachFeature: function(feature, layer) {
+                    const regionName = feature.properties.name;
+                    const isoCode = geoJsonMapping[regionName];
+                    let popupContent = `<div class="popup-title">${regionName}</div>`;
+
+                    if (isoCode && alertsData[isoCode] && alertsData[isoCode].alert === 1) {
+                        const info = alertsData[isoCode];
+                        popupContent += `<div class="popup-status" style="color: #f87171;">⚠️ ОБНАРУЖЕНА УГРОЗА БПЛА / АТАКА</div>`;
+                        if (info.title) popupContent += `<div style="font-size:11px; margin-top:5px; color:#cbd5e1;">${info.title}</div>`;
+                    } else {
+                        popupContent += `<div class="popup-status" style="color: #34d399;">🟢 Обстановка спокойная</div>`;
+                    }
+                    
+                    layer.bindPopup(popupContent);
                 }
+            }).addTo(map);
 
-                const hasAlert = isoCode && alertsData[isoCode] && alertsData[isoCode].alert === 1;
-
-                return {
-                    fillColor: hasAlert ? '#ef4444' : '#10b981',
-                    weight: 1.5,
-                    opacity: 0.8,
-                    color: '#334155',
-                    fillOpacity: hasAlert ? 0.6 : 0.2
-                };
-            },
-            onEachFeature: function(feature, layer) {
-                layer.bindPopup(`<b>${feature.properties.name}</b>`);
-            }
-        }).addTo(map);
+        } catch (error) {
+            console.error("Ошибка инициализации карты компонентов:", error);
+        }
     }
 
-    const legend = L.control({position: 'bottomright'});
+    // Создание панели легенды управления в углу экрана
+    const legend = L.control({ position: 'bottomright' });
     legend.onAdd = function () {
         const div = L.DomUtil.create('div', 'legend');
-        div.innerHTML += '<i style="background: #ef4444"></i> Опасность / Тревога<br>';
-        div.innerHTML += '<i style="background: #10b981"></i> Спокойно';
+        div.innerHTML += '<b>Статус регионов:</b><br>';
+        div.innerHTML += '<i style="background: #ef4444"></i> Активная угроза / БПЛА<br>';
+        div.innerHTML += '<i style="background: #10b981"></i> Норма / Отбой';
         return div;
     };
     legend.addTo(map);
 
-    initMap();
+    // Запуск сборщика карты
+    loadAlertsMap();
 </script>
 </body>
 </html>
